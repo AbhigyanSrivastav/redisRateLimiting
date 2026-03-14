@@ -10,6 +10,7 @@ const redis = new Redis();
 // 3. count the total no of req if lest then 60 then allow it
 
     const slidingWindowCounter = async (userId)=>{
+        const pipeline = redis.pipeline(); //per req instance
         const window = 60;
         const limit = 60;
         const ttl = window * 2;
@@ -27,7 +28,7 @@ const redis = new Redis();
             const timestamp = Number(timestampKey);
 
             if(timestamp < floorBucket){
-                expiredTime.push(timestamp);
+                expiredTime.push(timestampKey);
             }
             if(timestamp == floorBucket) continue;
             
@@ -36,14 +37,13 @@ const redis = new Redis();
                 sum += Number(count);
             }
         }   
-        await redis.hdel(rateKey,...expiredTime)
-        if(sum>=limit){
-            return "not allowed";
-        }else{
-            await redis.hincrby(rateKey,bucket,1);
-            await redis.expire(rateKey,ttl)
-            return 'allowed'
+        if(sum<limit){
+            pipeline.hincrby(rateKey,bucket,1);
+            pipeline.expire(rateKey,ttl)
         }
+        pipeline.hdel(rateKey,...expiredTime)
+        await pipeline.exec();
+        return sum<limit ? 'allowed' : "not allowed";
     }
 
 // 
@@ -64,6 +64,7 @@ const redis = new Redis();
 // Each request costs 1 token -> No tokens? Rejected.
 // 
 const tokenBucket = async(userId) =>{
+    const pipeline = redis.pipeline(); //per req instance
     const now = Date.now();
     const rateKey = `rate:${userId}`
     const maxTokens = 10;
@@ -71,22 +72,39 @@ const tokenBucket = async(userId) =>{
 
     const userBucket = await redis.hgetall(rateKey);
     if(!userBucket.tokens){
-    await redis.hset(rateKey,{tokens: maxTokens -1 , lastRefill: now})
-    await redis.expire(rateKey,60)
+    pipeline.hset(rateKey,{tokens: maxTokens -1 , lastRefill: now})
+    pipeline.expire(rateKey,60);
+    await pipeline.exec();
     return 'allowed';
     }
     const userTokens = Number(userBucket.tokens);
     const userLastRefilledAt = Number(userBucket.lastRefill);
     const timePassed = (now - userLastRefilledAt) / 1000; //sec
     const refill = refillRate * timePassed;
-    const newTokens = Math.min(maxTokens, userTokens + refill)
+    const newTokens = Math.min(maxTokens, userTokens + refill);
+    let newSet = {};
     if(newTokens<1){
-    await redis.hset(rateKey,{tokens: newTokens, lastRefill: now})
-    await redis.expire(rateKey,60)
-    return 'not allowed'
-    } 
-    await redis.hset(rateKey,{tokens: newTokens -1, lastRefill: now})
-    await redis.expire(rateKey,60)
-    return "allowed";
+    newSet = {
+        tokens: newTokens,
+        lastRefill: now
+    }
 
+    } else{
+    newSet = {
+        tokens: newTokens -1,
+        lastRefill: now    
+    }
+    }
+    pipeline.hset(rateKey,newSet)
+    pipeline.expire(rateKey,60);
+    await pipeline.exec();
+    return newTokens > 1 ? "allowed": "not allowed";
 }
+
+(async () => {
+   const slidingWindowCounterResult = await slidingWindowCounter("user123");
+   console.log(slidingWindowCounterResult);
+
+   const tokenBucketResult = await tokenBucket("user123");
+   console.log(tokenBucketResult);
+})();
